@@ -12,7 +12,7 @@ edition = "2018"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1.0", features = ["client", "client-legacy", "tokio", "http1"] }
+hyper-util = { version = "0.1.0", features = ["client-legacy", "tokio", "http1"] }
 http = "1"
 bytes = "1"
 http-body-util = "0.1"

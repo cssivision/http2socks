@@ -50,7 +50,7 @@ impl Service<Uri> for SocksConnector {
 
     fn call(&mut self, uri: Uri) -> Self::Future {
         let host = uri.host().map(|v| v.to_string()).unwrap_or_default();
-        let port = uri.port_u16().unwrap_or_else(|| 80);
+        let port = uri.port_u16().unwrap_or(80);
         log::debug!("proxy address {}:{}", host, port);
 
         let addr = self.addr;
@@ -247,7 +247,7 @@ async fn proxy(
         // `on_upgrade` future.
         if req.uri().authority().is_some() {
             let host = req.uri().host().map(|v| v.to_string()).unwrap_or_default();
-            let port = req.uri().port_u16().unwrap_or_else(|| 80);
+            let port = req.uri().port_u16().unwrap_or(80);
             tokio::spawn(async move {
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {

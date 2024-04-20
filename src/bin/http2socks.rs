@@ -10,15 +10,19 @@ use base64::alphabet;
 use base64::engine::general_purpose::PAD;
 use base64::engine::GeneralPurpose;
 use base64::Engine;
-use hyper::client::Client;
+use bytes::Bytes;
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::header::{HeaderValue, PROXY_AUTHORIZATION};
-use hyper::server::Server;
-use hyper::service::{make_service_fn, service_fn, Service};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
 use hyper::upgrade::Upgraded;
-use hyper::{Body, Method, Request, Response, Uri};
+use hyper::{Method, Request, Response, Uri};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
+use tower_service::Service;
 
 use http2socks::args::parse_args;
 
@@ -35,14 +39,12 @@ impl SocksConnector {
     }
 }
 
-type SocksClient = Client<SocksConnector>;
-
 impl Service<Uri> for SocksConnector {
-    type Response = TcpStream;
+    type Response = TokioIo<TcpStream>;
     type Error = io::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
 
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
@@ -50,12 +52,13 @@ impl Service<Uri> for SocksConnector {
         let host = uri.host().map(|v| v.to_string()).unwrap_or_default();
         let port = uri.port_u16().unwrap_or_else(|| 80);
         log::debug!("proxy address {}:{}", host, port);
+
         let addr = self.addr;
         let fut = async move {
             log::debug!("connect to address {:?}", addr);
             let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await??;
             handshake(&mut stream, CONNECT_TIMEOUT, host, port).await?;
-            Ok(stream)
+            Ok(TokioIo::new(stream))
         };
         Box::pin(fut)
     }
@@ -132,9 +135,12 @@ async fn handshake(conn: &mut TcpStream, dur: Duration, host: String, port: u16)
 async fn main() -> io::Result<()> {
     env_logger::init();
     let config = parse_args("http2socks").unwrap();
-    log::info!("config: {}", serde_json::to_string_pretty(&config).unwrap());
+    log::info!(
+        "config: \n{}",
+        toml::ser::to_string_pretty(&config).unwrap()
+    );
 
-    let local_addr = config
+    let local_addr: SocketAddr = config
         .local_addr
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid local address"))?;
@@ -143,36 +149,43 @@ async fn main() -> io::Result<()> {
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid server address"))?;
 
-    let client = Client::builder()
+    let client = Client::builder(TokioExecutor::new())
         .http1_title_case_headers(true)
         .http1_preserve_header_case(true)
-        .build::<_, hyper::Body>(SocksConnector::new(server_addr));
+        .build(SocksConnector::new(server_addr));
     let authorization = format!("{}:{}", config.username, config.password)
         .as_bytes()
         .to_vec();
 
-    let make_service = make_service_fn(move |_| {
+    let listener = TcpListener::bind(&local_addr).await?;
+    log::debug!("Listening on http://{}", local_addr);
+
+    loop {
+        let (stream, addr) = listener.accept().await?;
+        log::debug!("accept stream from {:?}", addr);
+        let io = TokioIo::new(stream);
         let client = client.clone();
         let authorization = authorization.clone();
-        async move {
-            Ok::<_, hyper::Error>(service_fn(move |req| {
-                let client = client.clone();
-                let authorization = authorization.clone();
-                let fut = async move { proxy(client, req, server_addr, authorization).await };
-                fut
-            }))
-        }
-    });
 
-    let server = Server::bind(&local_addr)
-        .http1_preserve_header_case(true)
-        .http1_title_case_headers(true)
-        .serve(make_service);
-
-    println!("Listening on http://{}", local_addr);
-
-    server.await.map_err(|e| other(&e.to_string()))?;
-    Ok(())
+        tokio::spawn(async move {
+            if let Err(err) = http1::Builder::new()
+                .preserve_header_case(true)
+                .title_case_headers(true)
+                .serve_connection(
+                    io,
+                    service_fn(|req| {
+                        let client = client.clone();
+                        let authorization = authorization.clone();
+                        async move { proxy(client, req, server_addr, authorization).await }
+                    }),
+                )
+                .with_upgrades()
+                .await
+            {
+                log::error!("Failed to serve connection: {:?}", err);
+            }
+        });
+    }
 }
 
 fn proxy_authorization(authorization: &[u8], header_value: Option<&HeaderValue>) -> bool {
@@ -191,16 +204,28 @@ fn proxy_authorization(authorization: &[u8], header_value: Option<&HeaderValue>)
     }
 }
 
+fn empty() -> BoxBody<Bytes, hyper::Error> {
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
+
 async fn proxy(
-    client: SocksClient,
-    mut req: Request<Body>,
+    client: Client<SocksConnector, hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
     server_addr: SocketAddr,
     authorization: Vec<u8>,
-) -> Result<Response<Body>, hyper::Error> {
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     log::debug!("req: {:?}", req);
     if !proxy_authorization(&authorization, req.headers().get(PROXY_AUTHORIZATION)) {
         log::error!("authorization fail");
-        let mut resp = Response::new(Body::empty());
+        let mut resp = Response::new(empty());
         *resp.status_mut() = http::StatusCode::PROXY_AUTHENTICATION_REQUIRED;
         return Ok(resp);
     }
@@ -233,36 +258,37 @@ async fn proxy(
                     Err(e) => log::error!("upgrade error: {}", e),
                 }
             });
-            Ok(Response::new(Body::empty()))
+            Ok(Response::new(empty()))
         } else {
             log::error!("CONNECT host is not socket addr: {:?}", req.uri());
-            let mut resp = Response::new(Body::from("CONNECT must be to a socket address"));
+            let mut resp = Response::new(full("CONNECT must be to a socket address"));
             *resp.status_mut() = http::StatusCode::BAD_REQUEST;
             Ok(resp)
         }
     } else {
-        client.request(req).await.or_else(|e| {
-            log::error!("client request error {:?}", e);
-            let mut resp =
-                Response::new(Body::from(format!("proxy server interval error {:?}", e)));
-            *resp.status_mut() = http::StatusCode::BAD_REQUEST;
-            Ok(resp)
-        })
+        match client.request(req).await {
+            Ok(res) => Ok(Response::new(res.boxed())),
+            Err(e) => {
+                let mut resp = Response::new(full(format!("proxy server interval error {:?}", e)));
+                *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+                Ok(resp)
+            }
+        }
     }
 }
 
 // Create a TCP connection to host:port, build a tunnel between the connection and
 // the upgraded connection
 async fn tunnel(
-    mut upgraded: Upgraded,
+    upgraded: Upgraded,
     host: String,
     port: u16,
     server_addr: SocketAddr,
 ) -> io::Result<()> {
+    let mut upgraded = TokioIo::new(upgraded);
     let mut server = timeout(CONNECT_TIMEOUT, TcpStream::connect(server_addr)).await??;
     handshake(&mut server, CONNECT_TIMEOUT, host, port).await?;
     let (n1, n2) = copy_bidirectional(&mut upgraded, &mut server).await?;
     log::debug!("client wrote {} bytes and received {} bytes", n1, n2);
-
     Ok(())
 }

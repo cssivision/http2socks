@@ -1,68 +1,28 @@
-use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::str::FromStr;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
+use awak::net::{TcpListener, TcpStream};
+use awak::time::timeout;
+use awak::util::copy_bidirectional;
 use base64::alphabet;
 use base64::engine::general_purpose::PAD;
 use base64::engine::GeneralPurpose;
 use base64::Engine;
 use bytes::Bytes;
+use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::header::{HeaderValue, PROXY_AUTHORIZATION};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::upgrade::Upgraded;
-use hyper::{Method, Request, Response, Uri};
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
-use tower_service::Service;
+use hyper::{Method, Request, Response};
 
 use http2socks::args::parse_args;
+use http2socks::rt::HyperIo;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-
-#[derive(Clone)]
-struct SocksConnector {
-    addr: SocketAddr,
-}
-
-impl SocksConnector {
-    fn new(addr: SocketAddr) -> SocksConnector {
-        SocksConnector { addr }
-    }
-}
-
-impl Service<Uri> for SocksConnector {
-    type Response = TokioIo<TcpStream>;
-    type Error = io::Error;
-    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, uri: Uri) -> Self::Future {
-        let host = uri.host().map(|v| v.to_string()).unwrap_or_default();
-        let port = uri.port_u16().unwrap_or(80);
-        log::debug!("proxy address {}:{}", host, port);
-
-        let addr = self.addr;
-        let fut = async move {
-            log::debug!("connect to address {:?}", addr);
-            let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await??;
-            handshake(&mut stream, CONNECT_TIMEOUT, host, port).await?;
-            Ok(TokioIo::new(stream))
-        };
-        Box::pin(fut)
-    }
-}
 
 fn other(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, msg)
@@ -131,8 +91,7 @@ async fn handshake(conn: &mut TcpStream, dur: Duration, host: String, port: u16)
 //    $ export https_proxy=http://127.0.0.1:8100
 // 3. send requests
 //    $ curl -i https://www.google.com/
-#[tokio::main]
-async fn main() -> io::Result<()> {
+fn main() -> io::Result<()> {
     env_logger::init();
     let config = parse_args("http2socks").unwrap();
     log::info!(
@@ -149,43 +108,40 @@ async fn main() -> io::Result<()> {
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid server address"))?;
 
-    let client = Client::builder(TokioExecutor::new())
-        .http1_title_case_headers(true)
-        .http1_preserve_header_case(true)
-        .build(SocksConnector::new(server_addr));
     let authorization = format!("{}:{}", config.username, config.password)
         .as_bytes()
         .to_vec();
 
-    let listener = TcpListener::bind(&local_addr).await?;
-    log::debug!("Listening on http://{}", local_addr);
+    awak::block_on(async move {
+        let listener = TcpListener::bind(&local_addr).await?;
+        log::debug!("Listening on http://{}", local_addr);
 
-    loop {
-        let (stream, addr) = listener.accept().await?;
-        log::debug!("accept stream from {:?}", addr);
-        let io = TokioIo::new(stream);
-        let client = client.clone();
-        let authorization = authorization.clone();
+        loop {
+            let (stream, addr) = listener.accept().await?;
+            log::debug!("accept stream from {:?}", addr);
+            let io = HyperIo::new(stream);
+            let authorization = authorization.clone();
 
-        tokio::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .preserve_header_case(true)
-                .title_case_headers(true)
-                .serve_connection(
-                    io,
-                    service_fn(|req| {
-                        let client = client.clone();
-                        let authorization = authorization.clone();
-                        async move { proxy(client, req, server_addr, authorization).await }
-                    }),
-                )
-                .with_upgrades()
-                .await
-            {
-                log::error!("Failed to serve connection: {:?}", err);
-            }
-        });
-    }
+            awak::spawn(async move {
+                if let Err(err) = http1::Builder::new()
+                    .preserve_header_case(true)
+                    .title_case_headers(true)
+                    .serve_connection(
+                        io,
+                        service_fn(|req| {
+                            let authorization = authorization.clone();
+                            async move { proxy(req, server_addr, authorization).await }
+                        }),
+                    )
+                    .with_upgrades()
+                    .await
+                {
+                    log::error!("Failed to serve connection: {:?}", err);
+                }
+            })
+            .detach();
+        }
+    })
 }
 
 fn proxy_authorization(authorization: &[u8], header_value: Option<&HeaderValue>) -> bool {
@@ -217,7 +173,6 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
 }
 
 async fn proxy(
-    client: Client<SocksConnector, hyper::body::Incoming>,
     mut req: Request<hyper::body::Incoming>,
     server_addr: SocketAddr,
     authorization: Vec<u8>,
@@ -248,7 +203,7 @@ async fn proxy(
         if req.uri().authority().is_some() {
             let host = req.uri().host().map(|v| v.to_string()).unwrap_or_default();
             let port = req.uri().port_u16().unwrap_or(80);
-            tokio::spawn(async move {
+            awak::spawn(async move {
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
                         if let Err(e) = tunnel(upgraded, host, port, server_addr).await {
@@ -257,7 +212,8 @@ async fn proxy(
                     }
                     Err(e) => log::error!("upgrade error: {}", e),
                 }
-            });
+            })
+            .detach();
             Ok(Response::new(empty()))
         } else {
             log::error!("CONNECT host is not socket addr: {:?}", req.uri());
@@ -266,7 +222,7 @@ async fn proxy(
             Ok(resp)
         }
     } else {
-        match client.request(req).await {
+        match send_request(req, server_addr).await {
             Ok(res) => Ok(Response::new(res.boxed())),
             Err(e) => {
                 let mut resp = Response::new(full(format!("proxy server interval error {:?}", e)));
@@ -279,13 +235,44 @@ async fn proxy(
 
 // Create a TCP connection to host:port, build a tunnel between the connection and
 // the upgraded connection
+async fn send_request(
+    req: Request<hyper::body::Incoming>,
+    server_addr: SocketAddr,
+) -> io::Result<Response<hyper::body::Incoming>> {
+    let host = req.uri().host().map(|v| v.to_string()).unwrap_or_default();
+    let port = req.uri().port_u16().unwrap_or(80);
+    log::debug!("proxy {}:{} to  {:?}", host, port, server_addr);
+
+    let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(server_addr)).await??;
+    handshake(&mut stream, CONNECT_TIMEOUT, host, port).await?;
+
+    let (mut request_sender, connection) =
+        hyper::client::conn::http1::handshake(HyperIo::new(stream))
+            .await
+            .map_err(|e| other(&e.to_string()))?;
+
+    awak::spawn(async move {
+        if let Err(e) = connection.await {
+            log::error!("Error in connection: {}", e);
+        }
+    })
+    .detach();
+
+    request_sender
+        .send_request(req)
+        .await
+        .map_err(|e| other(&e.to_string()))
+}
+
+// Create a TCP connection to host:port, build a tunnel between the connection and
+// the upgraded connection
 async fn tunnel(
     upgraded: Upgraded,
     host: String,
     port: u16,
     server_addr: SocketAddr,
 ) -> io::Result<()> {
-    let mut upgraded = TokioIo::new(upgraded);
+    let mut upgraded = HyperIo::new(upgraded);
     let mut server = timeout(CONNECT_TIMEOUT, TcpStream::connect(server_addr)).await??;
     handshake(&mut server, CONNECT_TIMEOUT, host, port).await?;
     let (n1, n2) = copy_bidirectional(&mut upgraded, &mut server).await?;

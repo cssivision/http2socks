@@ -10,9 +10,10 @@ readme = "README.md"
 edition = "2018"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1.0", features = ["client-legacy", "tokio", "http1"] }
+awak = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["io"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
+pin-project-lite = "0.2"
 http = "1"
 bytes = "1"
 http-body-util = "0.1"

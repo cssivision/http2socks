@@ -20,7 +20,7 @@ use hyper::upgrade::Upgraded;
 use hyper::{Method, Request, Response};
 
 use http2socks::args::parse_args;
-use http2socks::rt::HyperIo;
+use http2socks::rt::{HyperIo, HyperTimer};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -126,6 +126,7 @@ fn main() -> io::Result<()> {
                 if let Err(err) = http1::Builder::new()
                     .preserve_header_case(true)
                     .title_case_headers(true)
+                    .timer(HyperTimer::new())
                     .serve_connection(
                         io,
                         service_fn(|req| {

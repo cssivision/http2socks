@@ -182,7 +182,7 @@ impl Timer for HyperTimer {
 
     fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Sleep>> {
         Box::pin(HyperSleep {
-            inner: awak::time::delay_until(deadline.into()),
+            inner: awak::time::delay_until(deadline),
         })
     }
 
@@ -212,6 +212,6 @@ impl Sleep for HyperSleep {}
 
 impl HyperSleep {
     fn reset(self: Pin<&mut Self>, deadline: Instant) {
-        self.project().inner.as_mut().reset(deadline.into());
+        self.project().inner.as_mut().reset(deadline);
     }
 }

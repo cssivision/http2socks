@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use awak::net::{TcpListener, TcpStream};
@@ -12,7 +14,9 @@ use base64::engine::GeneralPurpose;
 use base64::Engine;
 use bytes::Bytes;
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
+use futures_util::lock::Mutex;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use hyper::client::conn::http1::SendRequest;
 use hyper::header::{HeaderValue, PROXY_AUTHORIZATION};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -20,6 +24,7 @@ use hyper::upgrade::Upgraded;
 use hyper::{Method, Request, Response};
 
 use http2socks::args::parse_args;
+use http2socks::pool::{Builder, ManageConnection, Pool};
 use http2socks::rt::{HyperIo, HyperTimer};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -112,6 +117,8 @@ fn main() -> io::Result<()> {
         .as_bytes()
         .to_vec();
 
+    let client = Client::new();
+
     awak::block_on(async move {
         let listener = TcpListener::bind(&local_addr).await?;
         log::debug!("Listening on http://{}", local_addr);
@@ -121,6 +128,7 @@ fn main() -> io::Result<()> {
             log::debug!("accept stream from {:?}", addr);
             let io = HyperIo::new(stream);
             let authorization = authorization.clone();
+            let client = client.clone();
 
             awak::spawn(async move {
                 if let Err(err) = http1::Builder::new()
@@ -131,7 +139,8 @@ fn main() -> io::Result<()> {
                         io,
                         service_fn(|req| {
                             let authorization = authorization.clone();
-                            async move { proxy(req, server_addr, authorization).await }
+                            let client = client.clone();
+                            async move { proxy(client, req, server_addr, authorization).await }
                         }),
                     )
                     .with_upgrades()
@@ -174,6 +183,7 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
 }
 
 async fn proxy(
+    client: Client,
     mut req: Request<hyper::body::Incoming>,
     server_addr: SocketAddr,
     authorization: Vec<u8>,
@@ -223,7 +233,7 @@ async fn proxy(
             Ok(resp)
         }
     } else {
-        match send_request(req, server_addr).await {
+        match client.send_request(req, server_addr).await {
             Ok(res) => Ok(Response::new(res.boxed())),
             Err(e) => {
                 let mut resp = Response::new(full(format!("proxy server interval error {:?}", e)));
@@ -232,37 +242,6 @@ async fn proxy(
             }
         }
     }
-}
-
-// Create a TCP connection to host:port, build a tunnel between the connection and
-// the upgraded connection
-async fn send_request(
-    req: Request<hyper::body::Incoming>,
-    server_addr: SocketAddr,
-) -> io::Result<Response<hyper::body::Incoming>> {
-    let host = req.uri().host().map(|v| v.to_string()).unwrap_or_default();
-    let port = req.uri().port_u16().unwrap_or(80);
-    log::debug!("proxy {}:{} to  {:?}", host, port, server_addr);
-
-    let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(server_addr)).await??;
-    handshake(&mut stream, CONNECT_TIMEOUT, host, port).await?;
-
-    let (mut request_sender, connection) =
-        hyper::client::conn::http1::handshake(HyperIo::new(stream))
-            .await
-            .map_err(|e| other(&e.to_string()))?;
-
-    awak::spawn(async move {
-        if let Err(e) = connection.await {
-            log::error!("Error in connection: {}", e);
-        }
-    })
-    .detach();
-
-    request_sender
-        .send_request(req)
-        .await
-        .map_err(|e| other(&e.to_string()))
 }
 
 // Create a TCP connection to host:port, build a tunnel between the connection and
@@ -279,4 +258,80 @@ async fn tunnel(
     let (n1, n2) = copy_bidirectional(&mut upgraded, &mut server).await?;
     log::debug!("client wrote {} bytes and received {} bytes", n1, n2);
     Ok(())
+}
+
+struct SocksManager {
+    addr: SocketAddr,
+    host: String,
+    port: u16,
+}
+
+impl ManageConnection for SocksManager {
+    /// The connection type this manager deals with.
+    type Connection = SendRequest<hyper::body::Incoming>;
+
+    /// Attempts to create a new connection.
+    async fn connect(&self) -> io::Result<Self::Connection> {
+        let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(self.addr)).await??;
+        handshake(&mut stream, CONNECT_TIMEOUT, self.host.clone(), self.port).await?;
+
+        let (request_sender, connection) = hyper::client::conn::http1::Builder::new()
+            .handshake(HyperIo::new(stream))
+            .await
+            .map_err(|e| other(&e.to_string()))?;
+
+        awak::spawn(async move {
+            if let Err(e) = connection.await {
+                log::error!("Error in connection: {}", e);
+            }
+        })
+        .detach();
+        Ok(request_sender)
+    }
+
+    /// Check if the connection is still valid, check background every `check_interval`.
+    ///
+    /// A standard implementation would check if a simple query like `PING` succee,
+    /// if the `Connection` is broken, error should return.
+    async fn check(&self, conn: &mut Self::Connection) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct Client {
+    inner: Arc<Mutex<HashMap<SocketAddr, Pool<SocksManager>>>>,
+}
+
+impl Client {
+    fn new() -> Client {
+        Client {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    // Create a TCP connection to host:port, build a tunnel between the connection and
+    // the remote connection
+    async fn send_request(
+        &self,
+        req: Request<hyper::body::Incoming>,
+        addr: SocketAddr,
+    ) -> io::Result<Response<hyper::body::Incoming>> {
+        let host = req.uri().host().map(|v| v.to_string()).unwrap_or_default();
+        let port = req.uri().port_u16().unwrap_or(80);
+        log::debug!("proxy {}:{} to  {:?}", host, port, addr);
+
+        let conn = SocksManager { addr, host, port };
+        let mut inner = self.inner.lock().await;
+        let pool = inner
+            .entry(addr)
+            .or_insert_with(|| Builder::new().build(conn))
+            .clone();
+
+        let mut request_sender = pool.get().await?;
+        request_sender
+            .send_request(req)
+            .await
+            .map_err(|e| other(&e.to_string()))
+    }
 }

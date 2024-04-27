@@ -293,7 +293,7 @@ impl ManageConnection for SocksManager {
     ///
     /// A standard implementation would check if a simple query like `PING` succee,
     /// if the `Connection` is broken, error should return.
-    async fn check(&self, conn: &mut Self::Connection) -> io::Result<()> {
+    async fn check(&self, _conn: &mut Self::Connection) -> io::Result<()> {
         Ok(())
     }
 }

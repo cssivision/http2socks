@@ -243,7 +243,7 @@ where
         Builder::new()
     }
 
-    fn interval<'a>(&'a self) -> MutexGuard<'a, PoolInternals<M::Connection>> {
+    fn interval(&self) -> MutexGuard<'_, PoolInternals<M::Connection>> {
         self.0.intervals.lock().unwrap()
     }
 
@@ -318,11 +318,7 @@ where
 
     fn exceed_limit(&self) -> bool {
         let max_size = self.0.max_size;
-        if max_size > 0 && self.interval().active > max_size {
-            true
-        } else {
-            false
-        }
+        max_size > 0 && self.interval().active > max_size
     }
 
     /// Retrieves a connection from the pool.
@@ -378,14 +374,14 @@ where
                 e
             })?;
 
-        return Ok(Connection {
+        Ok(Connection {
             conn: Some(IdleConn {
                 conn,
                 last_visited: Instant::now(),
                 created: Instant::now(),
             }),
             pool: self.clone(),
-        });
+        })
     }
 
     fn put(&mut self, mut conn: IdleConn<M::Connection>) {

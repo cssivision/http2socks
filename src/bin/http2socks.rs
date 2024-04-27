@@ -5,6 +5,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_pool::{Builder, ManageConnection, Pool};
 use awak::net::{TcpListener, TcpStream};
 use awak::time::timeout;
 use awak::util::copy_bidirectional;
@@ -24,7 +25,6 @@ use hyper::upgrade::Upgraded;
 use hyper::{Method, Request, Response};
 
 use http2socks::args::parse_args;
-use http2socks::pool::{Builder, ManageConnection, Pool};
 use http2socks::rt::{HyperIo, HyperTimer};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);

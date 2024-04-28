@@ -297,7 +297,7 @@ impl ManageConnection for SocksConnector {
     /// if the `Connection` is broken, error should return.
     async fn check(&self, conn: &mut Self::Connection) -> io::Result<()> {
         poll_fn(|cx| {
-            let _ = ready!(conn.poll_ready(cx)).map_err(|e| other(&e.to_string()))?;
+            ready!(conn.poll_ready(cx)).map_err(|e| other(&e.to_string()))?;
             Poll::Ready(Ok(()))
         })
         .await

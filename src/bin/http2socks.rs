@@ -119,7 +119,7 @@ fn main() -> io::Result<()> {
         .as_bytes()
         .to_vec();
 
-    let client = Client::new();
+    let socks_client = SocksClient::new(server_addr);
 
     awak::block_on(async move {
         let listener = TcpListener::bind(&local_addr).await?;
@@ -130,7 +130,7 @@ fn main() -> io::Result<()> {
             log::debug!("accept stream from {:?}", addr);
             let io = HyperIo::new(stream);
             let authorization = authorization.clone();
-            let client = client.clone();
+            let socks_client = socks_client.clone();
 
             awak::spawn(async move {
                 if let Err(err) = http1::Builder::new()
@@ -141,8 +141,8 @@ fn main() -> io::Result<()> {
                         io,
                         service_fn(|req| {
                             let authorization = authorization.clone();
-                            let client = client.clone();
-                            async move { proxy(client, req, server_addr, authorization).await }
+                            let socks_client = socks_client.clone();
+                            async move { proxy(socks_client, req, server_addr, authorization).await }
                         }),
                     )
                     .with_upgrades()
@@ -185,7 +185,7 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
 }
 
 async fn proxy(
-    client: Client,
+    socks_client: SocksClient,
     mut req: Request<hyper::body::Incoming>,
     server_addr: SocketAddr,
     authorization: Vec<u8>,
@@ -235,7 +235,7 @@ async fn proxy(
             Ok(resp)
         }
     } else {
-        match client.send_request(req, server_addr).await {
+        match socks_client.send_request(req).await {
             Ok(res) => Ok(Response::new(res.boxed())),
             Err(e) => {
                 let mut resp = Response::new(full(format!("proxy server interval error {:?}", e)));
@@ -262,19 +262,19 @@ async fn tunnel(
     Ok(())
 }
 
-struct SocksManager {
-    addr: SocketAddr,
+struct SocksConnector {
+    server_addr: SocketAddr,
     host: String,
     port: u16,
 }
 
-impl ManageConnection for SocksManager {
+impl ManageConnection for SocksConnector {
     /// The connection type this manager deals with.
     type Connection = SendRequest<hyper::body::Incoming>;
 
     /// Attempts to create a new connection.
     async fn connect(&self) -> io::Result<Self::Connection> {
-        let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(self.addr)).await??;
+        let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(self.server_addr)).await??;
         handshake(&mut stream, CONNECT_TIMEOUT, self.host.clone(), self.port).await?;
 
         let (request_sender, connection) = hyper::client::conn::http1::Builder::new()
@@ -305,14 +305,16 @@ impl ManageConnection for SocksManager {
 }
 
 #[derive(Clone)]
-struct Client {
-    inner: Arc<Mutex<HashMap<SocketAddr, Pool<SocksManager>>>>,
+struct SocksClient {
+    inner: Arc<Mutex<HashMap<String, Pool<SocksConnector>>>>,
+    server_addr: SocketAddr,
 }
 
-impl Client {
-    fn new() -> Client {
-        Client {
+impl SocksClient {
+    fn new(server_addr: SocketAddr) -> Self {
+        Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            server_addr,
         }
     }
 
@@ -321,16 +323,19 @@ impl Client {
     async fn send_request(
         &self,
         req: Request<hyper::body::Incoming>,
-        addr: SocketAddr,
     ) -> io::Result<Response<hyper::body::Incoming>> {
         let host = req.uri().host().map(|v| v.to_string()).unwrap_or_default();
         let port = req.uri().port_u16().unwrap_or(80);
-        log::debug!("proxy {}:{} to  {:?}", host, port, addr);
+        log::debug!("proxy {}:{} to {:?}", host, port, self.server_addr);
 
-        let conn = SocksManager { addr, host, port };
+        let conn = SocksConnector {
+            server_addr: self.server_addr,
+            host: host.clone(),
+            port,
+        };
         let mut inner = self.inner.lock().await;
         let pool = inner
-            .entry(addr)
+            .entry(format!("{}:{}", host, port))
             .or_insert_with(|| Builder::new().build(conn));
 
         let mut request_sender = pool.get().await?;

@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::{ready, Poll};
 use std::time::Duration;
 
 use async_pool::{Builder, ManageConnection, Pool};
@@ -293,8 +295,12 @@ impl ManageConnection for SocksManager {
     ///
     /// A standard implementation would check if a simple query like `PING` succee,
     /// if the `Connection` is broken, error should return.
-    async fn check(&self, _conn: &mut Self::Connection) -> io::Result<()> {
-        Ok(())
+    async fn check(&self, conn: &mut Self::Connection) -> io::Result<()> {
+        poll_fn(|cx| {
+            let _ = ready!(conn.poll_ready(cx)).map_err(|e| other(&e.to_string()))?;
+            Poll::Ready(Ok(()))
+        })
+        .await
     }
 }
 
@@ -325,8 +331,7 @@ impl Client {
         let mut inner = self.inner.lock().await;
         let pool = inner
             .entry(addr)
-            .or_insert_with(|| Builder::new().build(conn))
-            .clone();
+            .or_insert_with(|| Builder::new().build(conn));
 
         let mut request_sender = pool.get().await?;
         request_sender

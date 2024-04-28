@@ -77,9 +77,10 @@ dependencies = [
 [[package]]
 name = "async-pool"
 version = "0.1.0"
-source = "git+https://github.com/cssivision/async-pool.git#2dc002937bcdfde2c0deb792b111c6e688542249"
+source = "git+https://github.com/cssivision/async-pool.git#75e820ac29523fb8f08131ef2fab45fe819d69b2"
 dependencies = [
  "awak",
+ "log",
  "trait-variant",
 ]
 

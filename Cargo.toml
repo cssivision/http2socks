@@ -13,18 +13,15 @@ edition = "2018"
 awak = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["io"] }
 hyper = { version = "1", features = ["client", "server", "http1"] }
-pin-project-lite = "0.2"
 http = "1"
 bytes = "1"
 http-body-util = "0.1"
 log = "0.4"
 env_logger = "0.11"
-tower-service = "0.3"
 serde = "1.0"
 serde_derive = "1.0"
 getopts = "0.2"
 base64 = "0.22"
 toml = "0.8"
-trait-variant = "0.1.2"
 async-pool = { git = "https://github.com/cssivision/async-pool.git" }
 hyper-rt = "0.1"

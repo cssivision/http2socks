@@ -23,7 +23,6 @@ use hyper::client::conn::http1::SendRequest;
 use hyper::header::{HeaderValue, PROXY_AUTHORIZATION};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::upgrade::Upgraded;
 use hyper::{Method, Request, Response};
 use hyper_rt::{HyperIo, HyperTimer};
 
@@ -91,8 +90,8 @@ async fn handshake(conn: &mut TcpStream, dur: Duration, host: String, port: u16)
     timeout(dur, fut).await?
 }
 
-// To try this example:
-// 1. cargo run --example http_proxy
+// To try this:
+// 1. cargo run -- -c config.toml
 // 2. config http_proxy in command line
 //    $ export http_proxy=http://127.0.0.1:8100
 //    $ export https_proxy=http://127.0.0.1:8100
@@ -132,19 +131,28 @@ fn main() -> io::Result<()> {
             let authorization = authorization.clone();
             let socks_client = socks_client.clone();
 
+            let service = service_fn(move |mut req| {
+                let authorization = authorization.clone();
+                let socks_client = socks_client.clone();
+                async move {
+                    log::debug!("req: {:?}", req);
+                    if !authorize(&authorization, req.headers().get(PROXY_AUTHORIZATION)) {
+                        log::error!("authorization fail");
+                        let mut resp = Response::new(empty());
+                        *resp.status_mut() = http::StatusCode::PROXY_AUTHENTICATION_REQUIRED;
+                        return Ok(resp);
+                    }
+                    let _ = req.headers_mut().remove(PROXY_AUTHORIZATION);
+                    socks_client.proxy(req).await
+                }
+            });
+
             awak::spawn(async move {
                 if let Err(err) = http1::Builder::new()
                     .preserve_header_case(true)
                     .title_case_headers(true)
                     .timer(HyperTimer::new())
-                    .serve_connection(
-                        io,
-                        service_fn(|req| {
-                            let authorization = authorization.clone();
-                            let socks_client = socks_client.clone();
-                            async move { proxy(socks_client, req, server_addr, authorization).await }
-                        }),
-                    )
+                    .serve_connection(io, service)
                     .with_upgrades()
                     .await
                 {
@@ -156,7 +164,7 @@ fn main() -> io::Result<()> {
     })
 }
 
-fn proxy_authorization(authorization: &[u8], header_value: Option<&HeaderValue>) -> bool {
+fn authorize(authorization: &[u8], header_value: Option<&HeaderValue>) -> bool {
     if authorization == b":" {
         return true;
     }
@@ -182,84 +190,6 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
     Full::new(chunk.into())
         .map_err(|never| match never {})
         .boxed()
-}
-
-async fn proxy(
-    socks_client: SocksClient,
-    mut req: Request<hyper::body::Incoming>,
-    server_addr: SocketAddr,
-    authorization: Vec<u8>,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
-    log::debug!("req: {:?}", req);
-    if !proxy_authorization(&authorization, req.headers().get(PROXY_AUTHORIZATION)) {
-        log::error!("authorization fail");
-        let mut resp = Response::new(empty());
-        *resp.status_mut() = http::StatusCode::PROXY_AUTHENTICATION_REQUIRED;
-        return Ok(resp);
-    }
-    let _ = req.headers_mut().remove(PROXY_AUTHORIZATION);
-
-    if Method::CONNECT == req.method() {
-        // Received an HTTP request like:
-        // ```
-        // CONNECT www.domain.com:443 HTTP/1.1
-        // Host: www.domain.com:443
-        // Proxy-Connection: Keep-Alive
-        // ```
-        //
-        // When HTTP method is CONNECT we should return an empty body
-        // then we can eventually upgrade the connection and talk a new protocol.
-        //
-        // Note: only after client received an empty body with STATUS_OK can the
-        // connection be upgraded, so we can't return a response inside
-        // `on_upgrade` future.
-        if req.uri().authority().is_some() {
-            let host = req.uri().host().map(|v| v.to_string()).unwrap_or_default();
-            let port = req.uri().port_u16().unwrap_or(80);
-            awak::spawn(async move {
-                match hyper::upgrade::on(req).await {
-                    Ok(upgraded) => {
-                        if let Err(e) = tunnel(upgraded, host, port, server_addr).await {
-                            log::error!("tunnel io error: {}", e);
-                        };
-                    }
-                    Err(e) => log::error!("upgrade error: {}", e),
-                }
-            })
-            .detach();
-            Ok(Response::new(empty()))
-        } else {
-            log::error!("CONNECT host is not socket addr: {:?}", req.uri());
-            let mut resp = Response::new(full("CONNECT must be to a socket address"));
-            *resp.status_mut() = http::StatusCode::BAD_REQUEST;
-            Ok(resp)
-        }
-    } else {
-        match socks_client.send_request(req).await {
-            Ok(res) => Ok(Response::new(res.boxed())),
-            Err(e) => {
-                let mut resp = Response::new(full(format!("proxy server interval error {:?}", e)));
-                *resp.status_mut() = http::StatusCode::BAD_REQUEST;
-                Ok(resp)
-            }
-        }
-    }
-}
-
-// Create a TCP connection to host:port, build a tunnel between the connection and
-// the upgraded connection
-async fn tunnel(
-    upgraded: Upgraded,
-    host: String,
-    port: u16,
-    server_addr: SocketAddr,
-) -> io::Result<()> {
-    let mut upgraded = HyperIo::new(upgraded);
-    let mut server = timeout(CONNECT_TIMEOUT, TcpStream::connect(server_addr)).await??;
-    handshake(&mut server, CONNECT_TIMEOUT, host, port).await?;
-    let (n1, n2) = copy_bidirectional(&mut upgraded, &mut server).await?;
-    log::debug!("client wrote {} bytes and received {} bytes", n1, n2);
-    Ok(())
 }
 
 struct SocksConnector {
@@ -318,6 +248,49 @@ impl SocksClient {
         }
     }
 
+    async fn proxy(
+        self,
+        req: Request<hyper::body::Incoming>,
+    ) -> hyper::Result<Response<BoxBody<Bytes, hyper::Error>>> {
+        if Method::CONNECT == req.method() {
+            // Received an HTTP request like:
+            // ```
+            // CONNECT www.domain.com:443 HTTP/1.1
+            // Host: www.domain.com:443
+            // Proxy-Connection: Keep-Alive
+            // ```
+            //
+            // When HTTP method is CONNECT we should return an empty body
+            // then we can eventually upgrade the connection and talk a new protocol.
+            //
+            // Note: only after client received an empty body with STATUS_OK can the
+            // connection be upgraded, so we can't return a response inside
+            // `on_upgrade` future.
+            if req.uri().authority().is_some() {
+                awak::spawn(async move {
+                    if let Err(e) = self.tunnel(req).await {
+                        log::error!("tunnel io error: {}", e);
+                    }
+                })
+                .detach();
+                return Ok(Response::new(empty()));
+            }
+            log::error!("CONNECT host is not socket addr: {:?}", req.uri());
+            let mut resp = Response::new(full("CONNECT must be to a socket address"));
+            *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+            return Ok(resp);
+        }
+
+        match self.send_request(req).await {
+            Ok(res) => Ok(Response::new(res.boxed())),
+            Err(e) => {
+                let mut resp = Response::new(full(format!("proxy server interval error {:?}", e)));
+                *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+                Ok(resp)
+            }
+        }
+    }
+
     // Create a TCP connection to host:port, build a tunnel between the connection and
     // the remote connection
     async fn send_request(
@@ -343,5 +316,24 @@ impl SocksClient {
             .send_request(req)
             .await
             .map_err(|e| other(&e.to_string()))
+    }
+
+    // Create a TCP connection to host:port, build a tunnel between the connection and
+    // the upgraded connection
+    async fn tunnel(&self, req: Request<hyper::body::Incoming>) -> io::Result<()> {
+        let host = req.uri().host().map(|v| v.to_string()).unwrap_or_default();
+        let port = req.uri().port_u16().unwrap_or(80);
+
+        let upgraded = hyper::upgrade::on(req)
+            .await
+            .map_err(|e| other(&format!("upgrade fail: {}", &e.to_string())))?;
+
+        let mut server = timeout(CONNECT_TIMEOUT, TcpStream::connect(self.server_addr)).await??;
+        handshake(&mut server, CONNECT_TIMEOUT, host, port).await?;
+
+        let mut upgraded = HyperIo::new(upgraded);
+        let (n1, n2) = copy_bidirectional(&mut upgraded, &mut server).await?;
+        log::debug!("client wrote {} bytes and received {} bytes", n1, n2);
+        Ok(())
     }
 }

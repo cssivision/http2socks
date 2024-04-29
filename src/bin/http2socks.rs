@@ -25,9 +25,9 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::upgrade::Upgraded;
 use hyper::{Method, Request, Response};
+use hyper_rt::{HyperIo, HyperTimer};
 
 use http2socks::args::parse_args;
-use http2socks::rt::{HyperIo, HyperTimer};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 

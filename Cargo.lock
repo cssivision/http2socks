@@ -316,6 +316,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
+ "hyper-rt",
  "log",
  "pin-project-lite",
  "serde",
@@ -361,6 +362,18 @@ dependencies = [
  "smallvec",
  "tokio",
  "want",
+]
+
+[[package]]
+name = "hyper-rt"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af53d21dc838ddc7929657d237b1bbf3b710a5cfb00014ab0b90484c9f8e8d5a"
+dependencies = [
+ "awak",
+ "futures-io",
+ "hyper",
+ "pin-project-lite",
 ]
 
 [[package]]

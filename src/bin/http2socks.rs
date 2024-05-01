@@ -204,6 +204,7 @@ impl ManageConnection for SocksConnector {
 
     /// Attempts to create a new connection.
     async fn connect(&self) -> io::Result<Self::Connection> {
+        log::debug!("create new connection to {:?}", self.server_addr);
         let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(self.server_addr)).await??;
         handshake(&mut stream, CONNECT_TIMEOUT, self.host.clone(), self.port).await?;
 

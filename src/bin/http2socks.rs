@@ -120,7 +120,23 @@ fn main() -> io::Result<()> {
 
     let socks_client = SocksClient::new(server_addr);
 
-    awak::block_on(async move {
+    let service = service_fn(move |mut req| {
+        let authorization = authorization.clone();
+        let socks_client = socks_client.clone();
+        async move {
+            log::debug!("req: {:?}", req);
+            if !authorize(&authorization, req.headers().get(PROXY_AUTHORIZATION)) {
+                log::error!("authorization fail");
+                let mut resp = Response::new(empty());
+                *resp.status_mut() = http::StatusCode::PROXY_AUTHENTICATION_REQUIRED;
+                return Ok(resp);
+            }
+            let _ = req.headers_mut().remove(PROXY_AUTHORIZATION);
+            socks_client.proxy(req).await
+        }
+    });
+
+    awak::block_on(async {
         let listener = TcpListener::bind(&local_addr).await?;
         log::debug!("Listening on http://{}", local_addr);
 
@@ -128,24 +144,7 @@ fn main() -> io::Result<()> {
             let (stream, addr) = listener.accept().await?;
             log::debug!("accept stream from {:?}", addr);
             let io = HyperIo::new(stream);
-            let authorization = authorization.clone();
-            let socks_client = socks_client.clone();
-
-            let service = service_fn(move |mut req| {
-                let authorization = authorization.clone();
-                let socks_client = socks_client.clone();
-                async move {
-                    log::debug!("req: {:?}", req);
-                    if !authorize(&authorization, req.headers().get(PROXY_AUTHORIZATION)) {
-                        log::error!("authorization fail");
-                        let mut resp = Response::new(empty());
-                        *resp.status_mut() = http::StatusCode::PROXY_AUTHENTICATION_REQUIRED;
-                        return Ok(resp);
-                    }
-                    let _ = req.headers_mut().remove(PROXY_AUTHORIZATION);
-                    socks_client.proxy(req).await
-                }
-            });
+            let service = service.clone();
 
             awak::spawn(async move {
                 if let Err(err) = http1::Builder::new()

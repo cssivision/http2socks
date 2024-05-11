@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_pool::{Builder, ManageConnection, Pool};
 use awak::net::{TcpListener, TcpStream};
 use awak::time::timeout;
-use awak::util::copy_bidirectional;
+use awak::util::{copy_bidirectional, IdleTimeout};
 use base64::alphabet;
 use base64::engine::general_purpose::PAD;
 use base64::engine::GeneralPurpose;
@@ -332,7 +332,12 @@ impl SocksClient {
         handshake(&mut server, CONNECT_TIMEOUT, host, port).await?;
 
         let mut upgraded = HyperIo::new(upgraded);
-        let (n1, n2) = copy_bidirectional(&mut upgraded, &mut server).await?;
+        let (n1, n2) = IdleTimeout::new(
+            copy_bidirectional(&mut upgraded, &mut server),
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        )
+        .await??;
         log::debug!("client wrote {} bytes and received {} bytes", n1, n2);
         Ok(())
     }

@@ -5,7 +5,7 @@ license = "MIT"
 repository = "https://github.com/cssivision/http2socks"
 homepage = "https://github.com/cssivision/http2socks"
 authors = ["cssivision <cssivision@gmail.com>"]
-description = "http to socks proxy."
+description = "A http(s) over socks proxy"
 readme = "README.md"
 edition = "2018"
 

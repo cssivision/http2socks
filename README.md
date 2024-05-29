@@ -5,4 +5,4 @@ https://github.com/cssivision/http2socks/actions)
 [![License](http://img.shields.io/badge/license-mit-blue.svg)](https://github.com/cssivision/http2socks/blob/master/LICENSE)
 
 # http2socks
-A http to socks5 proxy.
+A http(s) over socks proxy.

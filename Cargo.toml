@@ -10,7 +10,7 @@ readme = "README.md"
 edition = "2018"
 
 [dependencies]
-awak = "0.2"
+awak = "0.2.37"
 futures-util = { version = "0.3", default-features = false, features = ["io"] }
 hyper = { version = "1", features = ["client", "server", "http1"] }
 http = "1"
@@ -18,10 +18,9 @@ bytes = "1"
 http-body-util = "0.1"
 log = "0.4"
 env_logger = "0.11"
-serde = "1.0"
-serde_derive = "1.0"
+serde = { version = "1", features = ["derive"] }
 getopts = "0.2"
 base64 = "0.22"
-toml = "0.8"
+toml = "0.9"
 async-pool = { git = "https://github.com/cssivision/async-pool.git" }
 hyper-rt = "0.1"

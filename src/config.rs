@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::{fs, io};
 
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Config {
@@ -20,7 +20,7 @@ impl Config {
             Ok(c) => c,
             Err(e) => {
                 log::error!("parse config error {}", e);
-                return Err(io::Error::new(io::ErrorKind::Other, e));
+                return Err(io::Error::other(e));
             }
         };
 

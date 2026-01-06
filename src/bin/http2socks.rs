@@ -30,10 +30,6 @@ use http2socks::args::parse_args;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-fn other(msg: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, msg)
-}
-
 pub mod v5 {
     pub const VERSION: u8 = 5;
     pub const METH_NO_AUTH: u8 = 0;
@@ -55,10 +51,10 @@ async fn handshake(conn: &mut TcpStream, dur: Duration, host: String, port: u16)
         log::trace!("read server socks version and mthod");
         conn.read_exact(buf1).await?;
         if buf1[0] != v5::VERSION {
-            return Err(other("unknown version"));
+            return Err(io::Error::other("unknown version"));
         }
         if buf1[1] != v5::METH_NO_AUTH {
-            return Err(other("unknow auth method"));
+            return Err(io::Error::other("unknow auth method"));
         }
 
         log::trace!("write socks5 version and command");
@@ -210,7 +206,7 @@ impl ManageConnection for SocksConnector {
         let (request_sender, connection) = hyper::client::conn::http1::Builder::new()
             .handshake(HyperIo::new(stream))
             .await
-            .map_err(|e| other(&e.to_string()))?;
+            .map_err(io::Error::other)?;
 
         awak::spawn(async move {
             if let Err(e) = connection.await {
@@ -227,7 +223,7 @@ impl ManageConnection for SocksConnector {
     /// if the `Connection` is broken, error should return.
     async fn check(&self, conn: &mut Self::Connection) -> io::Result<()> {
         poll_fn(|cx| {
-            ready!(conn.poll_ready(cx)).map_err(|e| other(&e.to_string()))?;
+            ready!(conn.poll_ready(cx)).map_err(io::Error::other)?;
             Poll::Ready(Ok(()))
         })
         .await
@@ -315,7 +311,7 @@ impl SocksClient {
         request_sender
             .send_request(req)
             .await
-            .map_err(|e| other(&e.to_string()))
+            .map_err(io::Error::other)
     }
 
     // Create a TCP connection to host:port, build a tunnel between the connection and
@@ -326,7 +322,7 @@ impl SocksClient {
 
         let upgraded = hyper::upgrade::on(req)
             .await
-            .map_err(|e| other(&format!("upgrade fail: {}", &e.to_string())))?;
+            .map_err(|e| io::Error::other(format!("upgrade fail: {}", &e.to_string())))?;
 
         let mut server = timeout(CONNECT_TIMEOUT, TcpStream::connect(self.server_addr)).await??;
         handshake(&mut server, CONNECT_TIMEOUT, host, port).await?;

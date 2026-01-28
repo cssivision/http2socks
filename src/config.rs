@@ -1,12 +1,13 @@
+use std::net::SocketAddr;
 use std::path::Path;
 use std::{fs, io};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize)]
 pub struct Config {
-    pub local_addr: String,
-    pub server_addr: String,
+    pub local_addr: SocketAddr,
+    pub server_addr: SocketAddr,
     #[serde(default)]
     pub username: String,
     #[serde(default)]

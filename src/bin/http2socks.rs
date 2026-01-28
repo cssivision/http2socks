@@ -101,20 +101,11 @@ fn main() -> io::Result<()> {
         toml::ser::to_string_pretty(&config).unwrap()
     );
 
-    let local_addr: SocketAddr = config
-        .local_addr
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid local address"))?;
-    let server_addr = config
-        .server_addr
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid server address"))?;
-
     let authorization = format!("{}:{}", config.username, config.password)
         .as_bytes()
         .to_vec();
 
-    let socks_client = SocksClient::new(server_addr);
+    let socks_client = SocksClient::new(config.server_addr);
 
     let service = service_fn(move |mut req| {
         let authorization = authorization.clone();
@@ -133,6 +124,7 @@ fn main() -> io::Result<()> {
     });
 
     awak::block_on(async {
+        let local_addr: SocketAddr = config.local_addr;
         let listener = TcpListener::bind(&local_addr).await?;
         log::debug!("Listening on http://{}", local_addr);
 

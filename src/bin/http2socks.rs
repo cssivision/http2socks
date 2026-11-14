@@ -314,7 +314,7 @@ impl SocksClient {
 
         let upgraded = hyper::upgrade::on(req)
             .await
-            .map_err(|e| io::Error::other(format!("upgrade fail: {}", &e.to_string())))?;
+            .map_err(|e| io::Error::other(format!("upgrade fail: {}", e)))?;
 
         let mut server = timeout(CONNECT_TIMEOUT, TcpStream::connect(self.server_addr)).await??;
         handshake(&mut server, CONNECT_TIMEOUT, host, port).await?;

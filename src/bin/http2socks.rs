@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_pool::{Builder, ManageConnection, Pool};
 use awak::net::{TcpListener, TcpStream};
 use awak::time::timeout;
-use awak::util::{copy_bidirectional, IdleTimeout};
+use awak::util::{copy_bidirectional_with_sizes, IdleTimeout};
 use base64::alphabet;
 use base64::engine::general_purpose::PAD;
 use base64::engine::GeneralPurpose;
@@ -29,6 +29,7 @@ use hyper_rt::{HyperIo, HyperTimer};
 use http2socks::args::parse_args;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_COPY_BUFFER_SIZE: usize = 8 * 1024;
 
 pub mod v5 {
     pub const VERSION: u8 = 5;
@@ -78,8 +79,39 @@ async fn handshake(conn: &mut TcpStream, dur: Duration, host: String, port: u16)
         conn.write_all(&address_bytes).await?;
 
         log::trace!("read server response");
-        let mut resp = vec![0u8; 4 + address_bytes.len()];
-        conn.read_exact(&mut resp).await?;
+        // The reply is VER | REP | RSV | ATYP | BND.ADDR | BND.PORT.  The
+        // reply's ATYP is chosen by the server and is independent of the
+        // request's address type, so the number of bytes to read must be
+        // derived from the reply itself, not from `address_bytes.len()`.
+        let mut head = [0u8; 4];
+        conn.read_exact(&mut head).await?;
+        if head[0] != v5::VERSION {
+            return Err(io::Error::other("unknown version"));
+        }
+        if head[1] != v5::REPLY_SUCESS {
+            return Err(io::Error::other(format!(
+                "socks5 connect failed with reply code {}",
+                head[1]
+            )));
+        }
+
+        let rest_len = match head[3] {
+            v5::TYPE_IPV4 => 4 + 2,
+            v5::TYPE_IPV6 => 16 + 2,
+            v5::TYPE_DOMAIN => {
+                let mut domain_len = [0u8; 1];
+                conn.read_exact(&mut domain_len).await?;
+                usize::from(domain_len[0]) + 2
+            }
+            address_type => {
+                return Err(io::Error::other(format!(
+                    "unknown address type {} in socks5 reply",
+                    address_type
+                )));
+            }
+        };
+        let mut bnd_addr = vec![0u8; rest_len];
+        conn.read_exact(&mut bnd_addr).await?;
 
         Ok(())
     };
@@ -294,10 +326,13 @@ impl SocksClient {
             host: host.clone(),
             port,
         };
-        let mut inner = self.inner.lock().await;
-        let pool = inner
-            .entry(format!("{}:{}", host, port))
-            .or_insert_with(|| Builder::new().build(conn));
+        let pool = {
+            let mut inner = self.inner.lock().await;
+            inner
+                .entry(format!("{}:{}", host, port))
+                .or_insert_with(|| Builder::new().build(conn))
+                .clone()
+        };
 
         let mut request_sender = pool.get().await?;
         request_sender
@@ -321,12 +356,87 @@ impl SocksClient {
 
         let mut upgraded = HyperIo::new(upgraded);
         let (n1, n2) = IdleTimeout::new(
-            copy_bidirectional(&mut upgraded, &mut server),
+            copy_bidirectional_with_sizes(&mut upgraded, &mut server, DEFAULT_COPY_BUFFER_SIZE),
             Duration::from_secs(300),
             Duration::from_secs(5),
         )
         .await??;
         log::debug!("client wrote {} bytes and received {} bytes", n1, n2);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs `handshake` against a loopback peer that first sends `reply` and
+    /// then stays silent.  `reply` must contain the method-selection reply
+    /// followed by the CONNECT reply.
+    async fn handshake_with_reply(reply: &[u8]) -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        // The TCP handshake completes via the listen backlog, so the client
+        // can connect before the server calls accept().
+        let mut client = TcpStream::connect(addr).await?;
+        let (mut server, _) = listener.accept().await?;
+        server.write_all(reply).await?;
+
+        handshake(&mut client, CONNECT_TIMEOUT, "example.com".to_string(), 80).await
+    }
+
+    fn with_method_reply(connect_reply: &[u8]) -> Vec<u8> {
+        let mut reply = vec![v5::VERSION, v5::METH_NO_AUTH];
+        reply.extend_from_slice(connect_reply);
+        reply
+    }
+
+    fn connect_reply(address_type: u8, address: &[u8]) -> Vec<u8> {
+        let mut reply = vec![v5::VERSION, v5::REPLY_SUCESS, 0, address_type];
+        reply.extend_from_slice(address);
+        reply.extend_from_slice(&80u16.to_be_bytes());
+        reply
+    }
+
+    #[test]
+    fn handshake_reads_reply_address_from_reply_type() {
+        awak::block_on(async {
+            // Domain target, IPv4 BND.ADDR: what common SOCKS5 servers
+            // (OpenSSH -D, sslocal, ...) return.  The reply is 10 bytes even
+            // though the old code expected 18 bytes for this request.
+            let ipv4 = connect_reply(v5::TYPE_IPV4, &[127, 0, 0, 1]);
+            handshake_with_reply(&with_method_reply(&ipv4))
+                .await
+                .expect("domain target with IPv4 reply");
+
+            // Domain target, IPv6 BND.ADDR (22-byte reply).
+            let ipv6 = connect_reply(v5::TYPE_IPV6, &[0u8; 16]);
+            handshake_with_reply(&with_method_reply(&ipv6))
+                .await
+                .expect("domain target with IPv6 reply");
+
+            // Domain target, domain BND.ADDR.
+            let mut address = vec![11u8];
+            address.extend_from_slice(b"example.com");
+            let domain = connect_reply(v5::TYPE_DOMAIN, &address);
+            handshake_with_reply(&with_method_reply(&domain))
+                .await
+                .expect("domain target with domain reply");
+
+            // A non-zero REP must be reported as an error instead of being
+            // treated as a successful handshake.
+            let mut failure = vec![v5::VERSION, 5, 0, v5::TYPE_IPV4];
+            failure.extend_from_slice(&[0, 0, 0, 0]);
+            failure.extend_from_slice(&80u16.to_be_bytes());
+            let err = handshake_with_reply(&with_method_reply(&failure))
+                .await
+                .expect_err("failed reply must not be accepted");
+            assert!(
+                err.to_string().contains("socks5 connect failed"),
+                "unexpected error: {}",
+                err
+            );
+        });
     }
 }

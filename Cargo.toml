@@ -9,7 +9,7 @@ readme = "README.md"
 edition = "2018"
 
 [dependencies]
-awak = "0.2.44"
+awak = "0.2.45"
 futures-util = { version = "0.3", default-features = false, features = ["io"] }
 hyper = { version = "1", features = ["client", "server", "http1"] }
 http = "1"

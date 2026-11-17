@@ -163,6 +163,7 @@ fn main() -> io::Result<()> {
         loop {
             let (stream, addr) = listener.accept().await?;
             log::debug!("accept stream from {:?}", addr);
+            let _ = stream.set_nodelay(true);
             let io = HyperIo::new(stream);
             let service = service.clone();
 
@@ -211,6 +212,21 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
         .boxed()
 }
 
+fn upstream_status(err: &io::Error) -> http::StatusCode {
+    if err.kind() == io::ErrorKind::TimedOut {
+        http::StatusCode::GATEWAY_TIMEOUT
+    } else {
+        http::StatusCode::BAD_GATEWAY
+    }
+}
+
+fn upstream_error_response(err: &io::Error) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let status = upstream_status(err);
+    let mut resp = Response::new(full(status.canonical_reason().unwrap_or("upstream error")));
+    *resp.status_mut() = status;
+    resp
+}
+
 struct SocksConnector {
     server_addr: SocketAddr,
     host: String,
@@ -225,6 +241,7 @@ impl ManageConnection for SocksConnector {
     async fn connect(&self) -> io::Result<Self::Connection> {
         log::debug!("create new connection to {:?}", self.server_addr);
         let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(self.server_addr)).await??;
+        let _ = stream.set_nodelay(true);
         handshake(&mut stream, CONNECT_TIMEOUT, self.host.clone(), self.port).await?;
 
         let (request_sender, connection) = hyper::client::conn::http1::Builder::new()
@@ -280,33 +297,42 @@ impl SocksClient {
             // Proxy-Connection: Keep-Alive
             // ```
             //
-            // When HTTP method is CONNECT we should return an empty body
-            // then we can eventually upgrade the connection and talk a new protocol.
-            //
-            // Note: only after client received an empty body with STATUS_OK can the
-            // connection be upgraded, so we can't return a response inside
-            // `on_upgrade` future.
-            if req.uri().authority().is_some() {
-                awak::spawn(async move {
-                    if let Err(e) = self.tunnel(req).await {
-                        log::error!("tunnel io error: {}", e);
-                    }
-                })
-                .detach();
-                return Ok(Response::new(empty()));
+            // Establish the upstream SOCKS5 connection before returning 200 so
+            // that connect/handshake failures reach the client as 502/504
+            // instead of a connection reset after a successful response.
+            if req.uri().authority().is_none() {
+                log::error!("CONNECT host is not socket addr: {:?}", req.uri());
+                let mut resp = Response::new(full("CONNECT must be to a socket address"));
+                *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+                return Ok(resp);
             }
-            log::error!("CONNECT host is not socket addr: {:?}", req.uri());
-            let mut resp = Response::new(full("CONNECT must be to a socket address"));
-            *resp.status_mut() = http::StatusCode::BAD_REQUEST;
-            return Ok(resp);
+
+            let host = req.uri().host().map(|v| v.to_string()).unwrap_or_default();
+            let port = req.uri().port_u16().unwrap_or(80);
+            let server = match connect_upstream(self.server_addr, host.clone(), port).await {
+                Ok(server) => server,
+                Err(e) => {
+                    log::error!("connect upstream {}:{} failed: {}", host, port, e);
+                    return Ok(upstream_error_response(&e));
+                }
+            };
+
+            // The 200 has to be sent before hyper performs the upgrade, so the
+            // copy loop runs in a detached task and waits on `on(req)`.
+            awak::spawn(async move {
+                if let Err(e) = tunnel(req, server).await {
+                    log::error!("tunnel io error: {}", e);
+                }
+            })
+            .detach();
+            return Ok(Response::new(empty()));
         }
 
         match self.send_request(req).await {
             Ok(res) => Ok(Response::new(res.boxed())),
             Err(e) => {
-                let mut resp = Response::new(full(format!("proxy server interval error {:?}", e)));
-                *resp.status_mut() = http::StatusCode::BAD_REQUEST;
-                Ok(resp)
+                log::error!("proxy request failed: {}", e);
+                Ok(upstream_error_response(&e))
             }
         }
     }
@@ -340,30 +366,34 @@ impl SocksClient {
             .await
             .map_err(io::Error::other)
     }
+}
 
-    // Create a TCP connection to host:port, build a tunnel between the connection and
-    // the upgraded connection
-    async fn tunnel(&self, req: Request<hyper::body::Incoming>) -> io::Result<()> {
-        let host = req.uri().host().map(|v| v.to_string()).unwrap_or_default();
-        let port = req.uri().port_u16().unwrap_or(80);
+async fn connect_upstream(
+    server_addr: SocketAddr,
+    host: String,
+    port: u16,
+) -> io::Result<TcpStream> {
+    let mut server = timeout(CONNECT_TIMEOUT, TcpStream::connect(server_addr)).await??;
+    let _ = server.set_nodelay(true);
+    handshake(&mut server, CONNECT_TIMEOUT, host, port).await?;
+    Ok(server)
+}
 
-        let upgraded = hyper::upgrade::on(req)
-            .await
-            .map_err(|e| io::Error::other(format!("upgrade fail: {}", e)))?;
+// Finish the tunnel once hyper has upgraded the client connection.
+async fn tunnel(req: Request<hyper::body::Incoming>, mut server: TcpStream) -> io::Result<()> {
+    let upgraded = hyper::upgrade::on(req)
+        .await
+        .map_err(|e| io::Error::other(format!("upgrade fail: {}", e)))?;
 
-        let mut server = timeout(CONNECT_TIMEOUT, TcpStream::connect(self.server_addr)).await??;
-        handshake(&mut server, CONNECT_TIMEOUT, host, port).await?;
-
-        let mut upgraded = HyperIo::new(upgraded);
-        let (n1, n2) = IdleTimeout::new(
-            copy_bidirectional_with_sizes(&mut upgraded, &mut server, DEFAULT_COPY_BUFFER_SIZE),
-            Duration::from_secs(300),
-            Duration::from_secs(5),
-        )
-        .await??;
-        log::debug!("client wrote {} bytes and received {} bytes", n1, n2);
-        Ok(())
-    }
+    let mut upgraded = HyperIo::new(upgraded);
+    let (n1, n2) = IdleTimeout::new(
+        copy_bidirectional_with_sizes(&mut upgraded, &mut server, DEFAULT_COPY_BUFFER_SIZE),
+        Duration::from_secs(300),
+        Duration::from_secs(5),
+    )
+    .await??;
+    log::debug!("client wrote {} bytes and received {} bytes", n1, n2);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -438,5 +468,17 @@ mod tests {
                 err
             );
         });
+    }
+
+    #[test]
+    fn maps_upstream_errors_to_gateway_status() {
+        assert_eq!(
+            upstream_status(&io::Error::from(io::ErrorKind::TimedOut)),
+            http::StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(
+            upstream_status(&io::Error::from(io::ErrorKind::ConnectionRefused)),
+            http::StatusCode::BAD_GATEWAY
+        );
     }
 }

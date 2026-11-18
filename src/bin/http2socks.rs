@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -25,11 +24,14 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_rt::{HyperIo, HyperTimer};
+use lru_time_cache::LruCache;
 
 use http2socks::args::parse_args;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_COPY_BUFFER_SIZE: usize = 8 * 1024;
+const MAX_DESTINATION_POOLS: usize = 256;
+const DESTINATION_POOL_TTL: Duration = Duration::from_secs(10 * 60);
 
 pub mod v5 {
     pub const VERSION: u8 = 5;
@@ -273,14 +275,17 @@ impl ManageConnection for SocksConnector {
 
 #[derive(Clone)]
 struct SocksClient {
-    inner: Arc<Mutex<HashMap<String, Pool<SocksConnector>>>>,
+    inner: Arc<Mutex<LruCache<String, Pool<SocksConnector>>>>,
     server_addr: SocketAddr,
 }
 
 impl SocksClient {
     fn new(server_addr: SocketAddr) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(LruCache::with_expiry_duration_and_capacity(
+                DESTINATION_POOL_TTL,
+                MAX_DESTINATION_POOLS,
+            ))),
             server_addr,
         }
     }
@@ -354,10 +359,16 @@ impl SocksClient {
         };
         let pool = {
             let mut inner = self.inner.lock().await;
-            inner
-                .entry(format!("{}:{}", host, port))
-                .or_insert_with(|| Builder::new().build(conn))
-                .clone()
+            let key = format!("{}:{}", host, port);
+            match inner.get(&key) {
+                Some(pool) => pool.clone(),
+                None => {
+                    let pool = Builder::new()
+                        .build(conn);
+                    inner.insert(key, pool.clone());
+                    pool
+                }
+            }
         };
 
         let mut request_sender = pool.get().await?;

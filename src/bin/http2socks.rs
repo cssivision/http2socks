@@ -363,8 +363,7 @@ impl SocksClient {
             match inner.get(&key) {
                 Some(pool) => pool.clone(),
                 None => {
-                    let pool = Builder::new()
-                        .build(conn);
+                    let pool = Builder::new().build(conn);
                     inner.insert(key, pool.clone());
                     pool
                 }

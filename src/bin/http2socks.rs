@@ -405,7 +405,13 @@ impl SocksClient {
         req: Request<hyper::body::Incoming>,
     ) -> io::Result<Response<hyper::body::Incoming>> {
         let host = req.uri().host().map(|v| v.to_string()).unwrap_or_default();
-        let port = req.uri().port_u16().unwrap_or(80);
+        let port = req.uri().port_u16().unwrap_or_else(|| {
+            if req.uri().scheme_str() == Some("https") {
+                443
+            } else {
+                80
+            }
+        });
         log::debug!("proxy {}:{} to {:?}", host, port, self.server_addr);
 
         let conn = SocksConnector {

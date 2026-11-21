@@ -282,6 +282,7 @@ dependencies = [
  "hyper",
  "hyper-rt",
  "log",
+ "lru_cache",
  "serde",
  "toml",
 ]
@@ -398,6 +399,14 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "lru_cache"
+version = "0.1.0"
+source = "git+https://github.com/cssivision/lru_cache.git?tag=0.1.0#6a6dda9c9aca04b6c8482ecd490904d1607791ad"
+dependencies = [
+ "awak",
+]
 
 [[package]]
 name = "memchr"

@@ -1,15 +1,13 @@
-use std::collections::HashMap;
 use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::task::{ready, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_pool::{Builder, ManageConnection, Pool};
 use awak::net::{TcpListener, TcpStream};
-use awak::time::{delay_for, timeout};
+use awak::time::timeout;
 use awak::util::{copy_bidirectional_with_sizes, IdleTimeout};
 use base64::alphabet;
 use base64::engine::general_purpose::PAD;
@@ -17,7 +15,6 @@ use base64::engine::GeneralPurpose;
 use base64::Engine;
 use bytes::Bytes;
 use futures_util::io::{AsyncReadExt, AsyncWriteExt};
-use futures_util::lock::Mutex;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::client::conn::http1::SendRequest;
 use hyper::header::{HeaderValue, PROXY_AUTHORIZATION};
@@ -27,6 +24,7 @@ use hyper::{Method, Request, Response};
 use hyper_rt::{HyperIo, HyperTimer};
 
 use http2socks::args::parse_args;
+use lru_cache::LRUCache;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_COPY_BUFFER_SIZE: usize = 8 * 1024;
@@ -276,72 +274,17 @@ impl ManageConnection for SocksConnector {
 
 #[derive(Clone)]
 struct SocksClient {
-    inner: Arc<Mutex<PoolCache>>,
+    inner: LRUCache<String, Pool<SocksConnector>>,
     server_addr: SocketAddr,
-}
-
-struct CachedPool {
-    pool: Pool<SocksConnector>,
-    last_used: Instant,
-}
-
-struct PoolCache {
-    pools: HashMap<String, CachedPool>,
-}
-
-impl PoolCache {
-    fn get(&mut self, key: &str) -> Option<Pool<SocksConnector>> {
-        let entry = self.pools.get_mut(key)?;
-        entry.last_used = Instant::now();
-        Some(entry.pool.clone())
-    }
-
-    fn insert(&mut self, key: String, pool: Pool<SocksConnector>) {
-        if self.pools.len() >= MAX_DESTINATION_POOLS {
-            self.evict_oldest();
-        }
-        self.pools.insert(
-            key,
-            CachedPool {
-                pool,
-                last_used: Instant::now(),
-            },
-        );
-    }
-
-    fn remove_expired(&mut self) {
-        self.pools
-            .retain(|_, entry| entry.last_used.elapsed() < DESTINATION_POOL_TTL);
-    }
-
-    fn evict_oldest(&mut self) {
-        if let Some(key) = self
-            .pools
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_used)
-            .map(|(key, _)| key.clone())
-        {
-            self.pools.remove(&key);
-        }
-    }
 }
 
 impl SocksClient {
     fn new(server_addr: SocketAddr) -> Self {
-        let inner = Arc::new(Mutex::new(PoolCache {
-            pools: HashMap::new(),
-        }));
-        let weak_inner = Arc::downgrade(&inner);
-        awak::spawn(async move {
-            loop {
-                delay_for(POOL_CLEANUP_INTERVAL).await;
-                let Some(inner) = weak_inner.upgrade() else {
-                    break;
-                };
-                inner.lock().await.remove_expired();
-            }
-        })
-        .detach();
+        let inner = LRUCache::new(
+            DESTINATION_POOL_TTL,
+            MAX_DESTINATION_POOLS,
+            POOL_CLEANUP_INTERVAL,
+        );
 
         Self { inner, server_addr }
     }
@@ -420,13 +363,12 @@ impl SocksClient {
             port,
         };
         let pool = {
-            let mut inner = self.inner.lock().await;
             let key = format!("{}:{}", host, port);
-            match inner.get(&key) {
+            match self.inner.get(&key) {
                 Some(pool) => pool,
                 None => {
                     let pool = Builder::new().build(conn);
-                    inner.insert(key, pool.clone());
+                    self.inner.insert(key, pool.clone());
                     pool
                 }
             }
